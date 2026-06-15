@@ -1,3 +1,5 @@
-*.Rmd linguist-language=R
 Analises.html linguist-generated=true
+*.xlsx linguist-detectable=false
+*.csv linguist-detectable=false
+*.Rmd linguist-language=R
 *.ipynb linguist-documentation=true
