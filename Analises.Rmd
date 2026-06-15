@@ -1,0 +1,803 @@
+---
+title: "Mensuração em Artes-terapia"
+subtitle: "Evidências Psicométricas e Validação In Silico"
+author: "Frederico Pedrosa"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex  
+    highlight: tango
+header-includes:
+  - \usepackage{placeins} 
+---
+
+# Set up
+
+```{r setup, message=FALSE,warning=FALSE}
+
+library(psych)
+library(readxl)
+library(lavaan)
+library(semTools)
+library(semPlot)
+library(EGAnet)
+library(dynamic)
+library(embedR)
+library(dplyr)
+library(lsa)
+library(eRm)
+library(mirt)
+library(ade4)
+```
+
+## Tratamento de dados
+
+```{r data}
+data <- read_excel("~/DSMT/SERATS/SERATS.xlsx")
+data <- data[-74]
+df <- as.data.frame(data)
+df[, c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] <- lapply(df[, c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)], as.factor)
+
+SERATS <- subset(df, select = SERATS_1:SERATS_9)
+SERATS <- SERATS[1:177,]
+describe(SERATS)
+sum(is.na(SERATS))
+```
+
+# Verificação do modelo SERATS
+
+```{r SERATS9}
+
+modelo <- '
+SERATS =~ SERATS_1 + SERATS_2 + SERATS_3 + SERATS_4 + SERATS_5 + SERATS_6 +
+SERATS_7 + SERATS_8 + SERATS_9
+'
+
+fit_modelo <- cfa(modelo, data = SERATS, ordered = T, 
+                     estimator = "WLSMV", std.lv=TRUE)
+
+fitMeasures(fit_modelo, fit.measures = c("chisq","df", "pvalue","cfi","tli", "rmsea", 
+                                            "rmsea.ci.lower", "rmsea.ci.upper","srmr"))
+
+
+compRelSEM(fit_modelo)
+
+summary(fit_modelo, standardized = T)
+```
+
+## Análise de redundância
+
+```{r UVA}
+UVA1 <- UVA(SERATS)
+print(UVA1)
+names(as.data.frame(UVA1$reduced_data))
+
+```
+
+## Validação do modelo estimado pela EGA (SERATS-5)
+
+```{r SERATS5}
+
+modeloEGA <- '
+SERATS =~ SERATS_2 + SERATS_5 + SERATS_6 + SERATS_7 + SERATS_9
+'
+
+fit_modelo_EGA <- cfa(modeloEGA, data = SERATS, ordered = T, 
+                      estimator = "WLSMV", std.lv=TRUE)
+
+fitMeasures(fit_modelo_EGA, fit.measures = c("chisq","df", "pvalue","cfi","tli", "rmsea", 
+                                         "rmsea.ci.lower", "rmsea.ci.upper","srmr"))
+
+compRelSEM(fit_modelo_EGA)
+
+summary(fit_modelo_EGA, fit.measures = TRUE, standardized = T)
+```
+
+
+## Correlação entre os escores fatoriais da SERATS-5 e SERATS
+
+```{r}
+
+esc1 <- lavPredict(fit_modelo)
+esc2 <- lavPredict(fit_modelo_EGA)
+
+idx1 <- lavInspect(fit_modelo, "case.idx")
+idx2 <- lavInspect(fit_modelo_EGA, "case.idx")
+
+df1 <- data.frame(id = idx1, f1 = as.numeric(esc1))
+df2 <- data.frame(id = idx2, f2 = as.numeric(esc2))
+
+dados_fatoriais <- merge(df1, df2, by = "id")
+
+set.seed(123) 
+n_perm <- 5000
+cor_obs <- cor(dados_fatoriais$f1, dados_fatoriais$f2, method = "pearson")
+cor_nulas <- numeric(n_perm)
+
+
+for(i in 1:n_perm) {
+  f2_perm <- sample(dados_fatoriais$f2)
+  cor_nulas[i] <- cor(dados_fatoriais$f1, f2_perm)
+}
+
+p_valor_perm <- sum(abs(cor_nulas) >= abs(cor_obs)) / n_perm
+
+round(cor_obs, 4)
+
+```
+
+# Índices Dinâmicos de Ajuste
+
+```{r DFI}
+dynFIT <- catOne(fit_modelo, plot = FALSE)
+dynFIT_EGA <- catOne(fit_modelo_EGA, plot = FALSE)
+
+dynFIT$fit
+dynFIT_EGA$fit
+```
+
+# Pseudo-CFA
+
+```{r, include=FALSE}
+er_set_tokens(cohere = "")
+
+```
+
+## Engenharia de Atributos
+
+```{r PseudoCFA}
+SERATS_clean <- na.omit(SERATS)
+SERATS_ega <- SERATS_clean[c(2,5,6,7,9)]
+
+gerar_features_pred <- function(df_longo, matriz_embeddings) {
+  features_list <- list()
+  
+  for(i in 1:nrow(df_longo)) {
+    id1 <- df_longo$Var1[i]
+    id2 <- df_longo$Var2[i]
+    
+    v1 <- matriz_embeddings[id1, ]
+    v2 <- matriz_embeddings[id2, ]
+    
+    # Features Vetoriais
+    diff_abs <- abs(v1 - v2)
+    prod_had <- v1 * v2
+    
+    # Features Escalares
+    cos_sim  <- as.numeric(lsa::cosine(v1, v2))
+    dist_euc <- sqrt(sum((v1 - v2)^2))
+    
+    # Combinar (Sem o r_target)
+    features_list[[i]] <- c(
+      sim_cosseno = cos_sim,
+      dist_euclidiana = dist_euc,
+      diff_abs,
+      prod_had
+    )
+  }
+  
+  df_final <- as.data.frame(do.call(rbind, features_list))
+  colnames(df_final) <- make.names(colnames(df_final))
+  return(df_final)
+}
+```
+
+## Criação de embeddings em Português e Inglês
+
+```{r}
+# Itens em Inglês e Português
+itens_serats_en <- c(
+  "s1"="I get in touch with my feelings through the process of making art",
+  "s2"="I am able to depict my feelings in art therapy",
+  "s3"="Through the process of making art, I am able to discover what is at play within me",
+  "s4"="I am able to express my feelings through the process of making art",
+  "s5"="I am able to make things fall into place in the art",
+  "s6"="Making art is a kind of outlet for me",
+  "s7"="A piece of art I have created can help me hold on to a particular feeling",
+  "s8"="I apply the new behavior that I have been experimenting with in art therapy outside of the therapy setting",
+  "s9"="I gain greater insight into my psyche through art therapy"
+)
+
+itens_serats_pt <- c(
+  "s1"="Eu me conecto com meus sentimentos por meio do fazer artístico.",
+  "s2"="Eu consigo representar meus sentimentos na arteterapia.",
+  "s3"="Eu consigo descobrir o que se passa em mim por meio do processo de criação artística.",
+  "s4"="Eu consigo expressar meus sentimentos por meio da criação artística.",
+  "s5"="Eu consigo dar sentido ao que sinto por meio da arte.",
+  "s6"="Fazer arte é uma forma de desabafar.",
+  "s7"="Consigo preservar um sentimento específico por meio de uma obra de arte que criei.",
+  "s8"="Aplico o novo comportamento que venho experimentando na arteterapia fora do ambiente terapêutico.",
+  "s9"="Compreendo melhor a minha psique por meio da arteterapia."
+)
+
+# Embeddings
+emb_en <- er_embed(itens_serats_en, api = "cohere", model = "embed-multilingual-v3.0")
+emb_pt <- er_embed(itens_serats_pt, api = "cohere", model = "embed-multilingual-v3.0")
+rownames(emb_en) <- names(itens_serats_en)
+rownames(emb_pt) <- names(itens_serats_pt)
+```
+
+## Criação der pares 
+
+```{r}
+df_serats_pares <- expand.grid(Var1 = names(itens_serats_en), 
+                               Var2 = names(itens_serats_en), 
+                               stringsAsFactors = FALSE) %>% 
+  filter(Var1 < Var2) # Agora funciona porque Var1 e Var2 são strings
+```
+
+## Criação das matrizes in silico
+
+```{r}
+df_feat_en <- gerar_features_pred(df_serats_pares, emb_en)
+df_feat_pt <- gerar_features_pred(df_serats_pares, emb_pt)
+mod_especialista_musica <- readRDS("~/Psicometria/Generativa/musicoterapia/Backup_Psicometria_Generativa/mod_mestre_cohere_en.rds")
+
+pred_en <- predict(mod_especialista_musica, df_feat_en)
+pred_pt <- predict(mod_especialista_musica, df_feat_pt)
+
+# Montar as Matrizes Sintéticas
+montar_matriz <- function(predicoes, nomes) {
+  mat <- matrix(1, nrow=9, ncol=9)
+  rownames(mat) <- colnames(mat) <- nomes
+  cont <- 1
+  for(i in 1:8) {
+    for(j in (i+1):9) {
+      mat[i,j] <- mat[j,i] <- predicoes[cont]
+      cont <- cont + 1
+    }
+  }
+  # Garante que seja uma matriz de correlação válida (PD)
+  return(as.matrix(Matrix::nearPD(mat, corr=TRUE)$mat))
+}
+
+mat_sim_en <- montar_matriz(pred_en, names(itens_serats_en))
+mat_sim_pt <- montar_matriz(pred_pt, names(itens_serats_pt))
+```
+
+## Pseudo-AFC da SERATS
+
+```{r}
+modelo_serats <- ' SERATS =~ s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 '
+
+fit_ia_en <- cfa(modelo_serats, sample.cov = mat_sim_en, sample.nobs = 1000, estimator = "ULS")
+fit_ia_pt <- cfa(modelo_serats, sample.cov = mat_sim_pt, sample.nobs = 1000, estimator = "ULS")
+
+
+cat("\n--- ESTRUTURA SINTÉTICA (INGLÊS) ---\n")
+fitMeasures(fit_ia_en, fit.measures = c("chisq","df", "pvalue","cfi","tli", "rmsea", 
+                                         "rmsea.ci.lower", "rmsea.ci.upper","srmr"))
+
+cat("\n--- ESTRUTURA SINTÉTICA (PORTUGUÊS) ---\n")
+fitMeasures(fit_ia_pt, fit.measures = c("chisq","df", "pvalue","cfi","tli", "rmsea",
+                                        "rmsea.ci.lower", "rmsea.ci.upper", "srmr"))
+
+```
+
+
+### Correlação entre as matrizes de correlação humana e estimada in silico
+
+```{r}
+cor_humana <- psych::polychoric(SERATS, na.rm = TRUE)$rho
+rownames(cor_humana) <- colnames(cor_humana) <- rownames(mat_sim_en)
+
+# Transformar ambas em vetores (apenas a parte triangular inferior, sem a diagonal)
+tri_human <- cor_humana[lower.tri(cor_humana)]
+tri_ia    <- mat_sim_en[lower.tri(mat_sim_en)]
+
+# Cálculo da Correlação de Matriz 
+cor_congruencia <- cor(tri_human, tri_ia)
+mae_matriz <- mean(abs(tri_human - tri_ia))
+
+cat("\n--- CONGRUÊNCIA DE MATRIZES (9 ITENS) ---\n")
+cat("Correlação de Pearson:", round(cor_congruencia, 3), "\n")
+cat("Variância Explicada (R²):", round(cor_congruencia^2, 3), "\n")
+cat("Erro Médio Absoluto (MAE):", round(mae_matriz, 3), "\n")
+
+```
+
+## Pseudo-AFC da SERATS-5
+
+```{r}
+modelo_serats5 <- ' SERATS =~ s2 + s5 + s6 + s7 + s9 '
+
+fit_ia_en5 <- cfa(modelo_serats5, sample.cov = mat_sim_en, sample.nobs = 1000, estimator = "ULS")
+fit_ia_pt5 <- cfa(modelo_serats5, sample.cov = mat_sim_pt, sample.nobs = 1000, estimator = "ULS")
+
+# RESULTADOS
+cat("\n--- ESTRUTURA SINTÉTICA 5 itens (INGLÊS) ---\n")
+fitMeasures(fit_ia_en5, fit.measures = c("chisq","df", "pvalue","cfi","tli", "rmsea", 
+                                         "rmsea.ci.lower", "rmsea.ci.upper","srmr"))
+cat("\n--- ESTRUTURA SINTÉTICA 5 itens (PORTUGUÊS) ---\n")
+fitMeasures(fit_ia_pt5, fit.measures = c("chisq","df", "pvalue","cfi","tli", "rmsea",
+                                        "rmsea.ci.lower", "rmsea.ci.upper", "srmr"))
+
+```
+
+### Correlação entre as matrizes de correlação humana de 5 itens e estimada in silico
+
+```{r}
+# Calcular a Policórica Real dos 5 itens selecionados
+itens_finais <- c("SERATS_2", "SERATS_5", "SERATS_6", "SERATS_7", "SERATS_9")
+cor_humana_vips <- psych::polychoric(SERATS_clean[, itens_finais], na.rm = TRUE)$rho
+
+# Definir os itens que sobreviveram 
+vips_reais <- c("s2", "s5", "s6", "s7", "s9")
+
+# Filtrar a matriz de embeddings original
+emb_vips <- emb_en[vips_reais, ]
+
+# Criar as 10 combinações únicas para os 5 itens
+df_pares_vips <- expand.grid(Var1 = vips_reais, 
+                             Var2 = vips_reais, 
+                             stringsAsFactors = FALSE) %>%
+  dplyr::filter(Var1 < Var2)
+
+# Gerar as features semânticas
+df_feat_vips <- gerar_features_pred(df_pares_vips, emb_vips)
+
+# Criar as 10 combinações únicas para os 5 itens
+df_pares_vips <- expand.grid(Var1 = vips_reais, 
+                             Var2 = vips_reais, 
+                             stringsAsFactors = FALSE) %>%
+  dplyr::filter(Var1 < Var2)
+
+# Gerar as features semânticas (usando a função de predição que criamos)
+df_feat_vips <- gerar_features_pred(df_pares_vips, emb_vips)
+
+# O Robô estima as correlações
+pred_vips <- predict(mod_especialista_musica, df_feat_vips)
+
+# Função para organizar as predições em formato de matriz
+montar_matriz_5x5 <- function(predicoes, nomes) {
+  mat <- matrix(1, nrow = 5, ncol = 5)
+  rownames(mat) <- colnames(mat) <- nomes
+  cont <- 1
+  for(i in 1:4) {
+    for(j in (i+1):5) {
+      mat[i, j] <- mat[j, i] <- predicoes[cont]
+      cont <- cont + 1
+    }
+  }
+  # Garante que a matriz seja Positiva Definida (correção geométrica)
+  mat_pd <- as.matrix(Matrix::nearPD(mat, corr = TRUE)$mat)
+  return(mat_pd)
+}
+
+# CRIAR A MATRIZ FINAL
+mat_final_sim <- montar_matriz_5x5(pred_vips, vips_reais)
+
+# Verificação
+#print(mat_final_sim)
+
+# Extrair os 10 pares únicos (triângulo inferior)
+tri_humana <- cor_humana_vips[lower.tri(cor_humana_vips)]
+tri_ia     <- mat_final_sim[lower.tri(mat_final_sim)]
+
+# Cálculo da Correlação e Erro
+cor_matriz_vips <- cor(tri_humana, tri_ia)
+#cor_spearman_vips <- cor(tri_humana, tri_ia, method = "spearman")
+mae_vips <- mean(abs(tri_humana - tri_ia))
+
+cat("\n--- CONGRUÊNCIA DE MATRIZES (5 ITENS VIPS) ---\n")
+cat("Correlação de Pearson:", round(cor_matriz_vips, 3), "\n")
+cat("Variância Explicada (R²):", round(cor_matriz_vips^2, 3), "\n")
+cat("Erro Médio Absoluto (MAE):", round(mae_vips, 3), "\n")
+```
+
+# Pseudo-Interceptos(Genole, 2026)
+
+## Estabele s Ground Truth com PCM
+
+```{r PCM}
+pcmSERATS <- PCM(SERATS_ega)
+thresERM <- thresholds(pcmSERATS)
+# 5. Comparar com os Thresholds Reais do Rasch (Média dos thresholds que você calculou)
+thresholds_reais <- c(s2=0.476, s5=1.741, s6=0.730, s7=1.291, s9=0.529) # s9 do seu print anterior
+
+```
+
+### Em inglês e português
+
+```{r}
+
+# Definir as Âncoras Semânticas
+ancora_baixa <- "Entro em contacto com os meus sentimentos ao fazer arte" # Item 1
+ancora_alta  <- "Eu consigo expressar meus sentimentos por meio da criação artística." # Item 3
+
+# Gerar Embeddings das Âncoras
+emb_ancoras <- er_embed(c(ancora_baixa, ancora_alta), api = "cohere", model = "embed-multilingual-v3.0")
+
+# Calcular o Eixo Semântico (Vetor Diferença)
+eixo_semantico <- emb_ancoras[2, ] - emb_ancoras[1, ]
+
+# 4. Projetar os itens da SERATS no eixo
+pseudo_interceptos <- as.numeric(emb_en[vips_reais, ] %*% eixo_semantico)
+names(pseudo_interceptos) <- vips_reais
+
+
+### Em português
+# 1. Projetar agora os itens em PORTUGUÊS no mesmo eixo
+(pseudo_interceptos_pt <- as.numeric(emb_pt[vips_reais, ] %*% eixo_semantico))
+
+# 2. Correlacionar com os mesmos thresholds reais
+cor_regua_pt <- cor(pseudo_interceptos_pt, thresholds_reais)
+
+cat("Correlação de Dificuldade (IA-Português vs Humano-Brasil):", round(cor_regua_pt, 3))
+```
+
+### GRM 
+
+```{r}
+# Ajustar o modelo GRM (1 fator) nos 5 itens vips
+# SERATS_vips deve conter as colunas SERATS_2, 5, 6, 7, 9
+fit_grm <- mirt(SERATS_clean[, itens_finais], 1, itemtype = 'graded', verbose = FALSE)
+
+# Extrair os parâmetros de item (IRTpars = TRUE para pegar o 'b' clássico)
+params_grm <- coef(fit_grm, simplify = TRUE, IRTpars = TRUE)$items
+
+# Calcular a 'Dificuldade Média' do item (Média dos thresholds b1, b2, b3, b4)
+# O GRM fornece 4 thresholds para 5 categorias
+dificuldade_grm <- rowMeans(params_grm[, 2:5])
+names(dificuldade_grm) <- vips_reais
+
+# 4. Comparar com os Pseudo-Interceptos da IA (aqueles que deram r=0.81)
+cor_ia_grm <- cor(pseudo_interceptos, dificuldade_grm)
+
+cat("\n--- RESULTADOS: IA vs. GRM (SAMEJIMA) ---\n")
+cat("Correlação de Dificuldade (IA vs GRM):", round(cor_ia_grm, 3), "\n")
+```
+
+### CFA (Interceptos)
+
+```{r}
+
+# 1. Extrair os parâmetros do modelo EGA
+params <- standardizedSolution(fit_modelo_EGA)
+
+# 2. Filtrar apenas os thresholds (|t1, |t2, etc)
+df_thresholds <- params %>% 
+  filter(op == "|") %>%
+  select(lhs, est.std)
+
+res_std <- standardizedSolution(fit_modelo_EGA)
+
+localizacao_cfa <- res_std %>% 
+  filter(op == "|") %>%              # Seleciona apenas os thresholds (|t1, |t2...)
+  select(lhs, est.std) %>%           # lhs = nome do item, est.std = valor padronizado
+  group_by(lhs) %>%                  # Agrupa pelo nome do item (SERATS_2, etc)
+  summarise(mean_threshold = mean(est.std)) # Calcula a média dos 4 thresholds
+
+# 3. Conferir o resultado
+print(localizacao_cfa)
+
+# 4. Organizar para a correlação com a IA
+# (Garanta que a ordem dos itens seja a mesma)
+meus_interceptos_humanos <- localizacao_cfa$mean_threshold
+names(meus_interceptos_humanos) <- c("s2", "s5", "s6", "s7", "s9")
+
+# 5. TESTE DEFINITIVO: IA vs CFA MACS
+cor_final_nigel <- cor(pseudo_interceptos, meus_interceptos_humanos)
+
+cat("\n--- VALIDAÇÃO ESTILO NIGEL GUENOLE (CFA Thresholds) ---\n")
+cat("Correlação de Dificuldade (IA vs CFA):", round(cor_final_nigel, 3), "\n")
+
+```
+
+# Comparações entre as redes
+
+```{r}
+mat_en_in <- t(emb_en)
+mat_pt_in <- t(emb_pt)
+
+EGA_en <- EGA(mat_en_in)
+EGA_pt <- EGA(mat_pt_in)
+
+compare1 <- EGAnet::compare.EGA.plots(EGA_pt,EGA_en)
+(compare2 <- EGAnet::community.compare(mat_en_in,mat_pt_in, seed = 123))
+```
+
+```{r}
+mat_en_5 <- mat_en_in[,c(2,5,6,7,9)]
+mat_pt_5 <- mat_pt_in[,c(2,5,6,7,9)]
+
+EGA_en_5 <- EGA(mat_en_5)
+EGA_pt_5 <- EGA(mat_pt_5)
+
+# Comparação 0
+compare3 <- EGAnet::compare.EGA.plots(EGA_pt_5,EGA_en_5)
+compare4 <- EGAnet::community.compare(mat_en_5,mat_pt_5, seed = 123)
+```
+
+```{r}
+# Comparação 1 - dimensionalidade
+(boot_pt <-  bootEGA(mat_pt_in, seed = 123))
+(boot_en <- bootEGA(mat_en_in, seed = 123))
+
+(boot_en5 <- bootEGA(mat_en_5, seed = 123))
+(boot_pt5 <- bootEGA(mat_pt_5, seed = 123))
+```
+
+```{r ,message=FALSE,warning=FALSE}
+# comparação força
+NetworkComparisonTest::NCT(mat_en_in,mat_pt_in)
+GGMncv::nct(mat_en_in,mat_pt_in)
+
+```
+
+### Plot
+
+```{r }
+#png("Comparacao_Redes_SERATS_Alta.png", 
+#    width = 10, 
+#    height = 6, 
+#    units = "in", 
+#    res = 300)
+
+# 2. Gerar o plot de comparação
+# O layout "glasso" garante que os nós fiquem na mesma posição para facilitar a comparação visual
+compare_plots <- EGAnet::compare.EGA.plots(
+  EGA_pt_5, 
+  EGA_en_5, 
+  labels = c("a)", "b)"),
+  base.plot = 1 # Usa a primeira rede como base para o layout
+)
+
+# 3. Imprimir o objeto de comparação (que combina os gráficos)
+print(compare_plots$all)
+
+# 4. Fechar o dispositivo e salvar o arquivo
+#dev.off()
+```
+
+## Centralidade
+
+```{r}
+
+# Equivalênscia estrutural 
+# 1. Calcular a centralidade (Strength) para ambas as redes
+# Usando os objetos EGA que você já criou (EGA_en e EGA_pt)
+cent_en <- EGAnet::net.loads(EGA_en,loading.method = "original")$std
+cent_pt <- EGAnet::net.loads(EGA_pt,loading.method = "original")$std
+
+# 2. Extrair apenas as cargas (loadings) do fator 1
+# (Como sua rede é unidimensional, focamos na força de cada item no Fator 1)
+loadings_en <- cent_en[,1]
+loadings_pt <- cent_pt[,1]
+
+# 3. Correlacionar as centralidades 
+cor_centralidade <- cor(loadings_en, loadings_pt, method = "spearman")
+
+round(cor_centralidade, 4)
+
+```
+
+## Teste de Mantel 
+
+```{r}
+# 1. Extrair as matrizes de rede (os pesos das arestas/edges)
+mat_en <- EGA_en$network
+mat_pt <- EGA_pt$network
+
+# 2. Transformar as matrizes em objetos de distância
+dist_en <- as.dist(1 - abs(mat_en))
+dist_pt <- as.dist(1 - abs(mat_pt))
+
+# 3. Executar o Teste de Mantel (com 9999 permutações)
+teste_mantel <- ade4::mantel.rtest(dist_en, dist_pt, nrepet = 9999)
+
+# 4. Resultados
+print(teste_mantel)
+
+```
+
+
+# Comparações com cosseno
+
+
+```{r}
+# 1. Cargas Humanas Reais (do fit_modelo_EGA)
+cargas_h <- c(0.663, 0.804, 0.687, 0.703, 0.744)
+
+# 2. Cargas da IA (do fit_final_ia)
+cargas_i <- c(0.763, 0.773, 0.718, 0.713, 0.826)
+
+# 3. Função de Tucker
+tucker_congruence <- function(x, y) {
+  sum(x * y) / sqrt(sum(x^2) * sum(y^2))
+}
+
+# 4. Cálculo
+cc_vips <- tucker_congruence(cargas_h, cargas_i)
+
+cat("\n--- TUCKER: ISOMORFISMO FATORIAL (5 ITENS) ---\n")
+cat("Coeficiente de Congruência (cc):", round(cc_vips, 4), "\n")
+
+# Interpretação de Lorenzo-Seva & ten Berge (2006)
+if(cc_vips > 0.95) {
+  cat("Interpretação: Fatores Virtualmente Idênticos\n")
+} else if(cc_vips > 0.85) {
+  cat("Interpretação: Boa Similaridade\n")
+} else {
+  cat("Interpretação: Baixa Similaridade\n")
+}
+
+
+# 1. Cargas Humanas Reais (9 itens - extraídas do seu primeiro summary)
+cargas_h_9 <- c(0.844, 0.740, 0.808, 0.777, 0.802, 0.654, 0.670, 0.663, 0.828)
+
+# 2. Cargas da IA (9 itens - extraídas do fit_ia_en)
+cargas_i_9 <- c(0.852, 0.775, 0.797, 0.702, 0.798, 0.736, 0.755, 0.756, 0.716)
+
+# 3. Matrizes de Correlação (36 pares únicos para 9 itens)
+# Reutilizando a cor_humana (policórica real 9x9) e a mat_sim_en (IA 9x9)
+tri_h_9 <- cor_humana[lower.tri(cor_humana)]
+tri_i_9 <- mat_sim_en[lower.tri(mat_sim_en)]
+
+# A. Tucker das Cargas Fatoriais
+cc_cargas_9 <- tucker_congruence(cargas_h_9, cargas_i_9)
+
+# B. Tucker das Matrizes
+cc_matriz_9 <- tucker_congruence(tri_h_9, tri_i_9)
+
+# C. Correlação de Matrizes (Pearson e R²)
+cor_mat_9 <- cor(tri_h_9, tri_i_9)
+mae_9 <- mean(abs(tri_h_9 - tri_i_9))
+
+cat("\n--- RESULTADOS: MODELO COMPLETO (9 ITENS) ---\n")
+cat("Tucker (Cargas Fatoriais):", round(cc_cargas_9, 4), "\n")
+cat("Tucker (Matrizes):", round(cc_matriz_9, 4), "\n")
+cat("Correlação de Matrizes (r):", round(cor_mat_9, 3), "\n")
+cat("Variância Explicada (R²):", round(cor_mat_9^2, 3), "\n")
+cat("Erro Médio Absoluto (MAE):", round(mae_9, 3), "\n")
+
+```
+
+
+```{r}
+
+# Gerar as features para predição
+df_feat_pred <- gerar_features_pred(df_serats_pares, emb_en)
+
+# Predizer e montar matriz 9x9 (Original)
+pred_9 <- predict(mod_especialista_musica, df_feat_pred)
+mat_sim_9 <- montar_matriz(pred_9, names(itens_serats_en))
+
+# Tucker e Correlação para os 9 itens
+tri_h_9 <- cor_humana[lower.tri(cor_humana)]
+tri_i_9 <- mat_sim_9[lower.tri(mat_sim_9)]
+r_9 <- cor(tri_h_9, tri_i_9)
+cc_9 <- tucker_congruence(tri_h_9, tri_i_9)
+
+# Tucker e Correlação para os 5 itens
+r_5 <- cor_matriz_vips 
+cc_5 <- 0.995       
+
+
+# --- PARA O MODELO DE 9 ITENS ---
+# 1. Calcular a matriz de similaridade de cosseno pura (sem ML)
+mat_cos_9 <- lsa::cosine(t(emb_en)) 
+
+# 2. Extrair o triângulo inferior (36 pares)
+tri_cos_9 <- mat_cos_9[lower.tri(mat_cos_9)]
+
+# 3. Correlacionar com a matriz humana (que você já tem: tri_h_9_certo)
+r_cos_9   <- cor(tri_h_9, tri_cos_9)
+mae_cos_9 <- mean(abs(tri_h_9 - tri_cos_9))
+
+# --- PARA O MODELO DE 5 ITENS ---
+# 1. Filtrar a matriz de cosseno para os 5 VIPs
+vips <- c("s2", "s5", "s6", "s7", "s9")
+mat_cos_5 <- mat_cos_9[vips, vips]
+tri_cos_5 <- mat_cos_5[lower.tri(mat_cos_5)]
+
+# 2. Correlacionar com a matriz humana de 5 itens (tri_humana)
+r_cos_5   <- cor(tri_humana, tri_cos_5)
+mae_cos_5 <- mean(abs(tri_humana - tri_cos_5))
+
+# --- TABELA DE COMPARACÃO FINAL PARA O LIVRO ---
+comparativo_metodos <- data.frame(
+  Escala = c("9 itens", "9 itens", "5 itens", "5 itens"),
+  Metodo = c("Cosseno (Linguístico)", "ElasticNet (IA-Psicométrica)", "Cosseno (Linguístico)", "ElasticNet (IA-Psicométrica)"),
+  Pearson_r = c(r_cos_9, r_9, r_cos_5, r_5),
+  Erro_MAE = c(mae_cos_9, mae_9, mae_cos_5, mae_vips)
+)
+
+print(comparativo_metodos)
+
+```
+
+### Mantel final
+
+```{r}
+# 1. Definir os itens da Versão Elite (Aqueles que ganharam a curadoria e ajuste manual)
+itens_elite_pt <- c(
+  "s2" = "Eu consigo representar meus sentimentos na arteterapia.",
+  "s5" = "Eu consigo dar sentido ao que sinto por meio da arte.",
+  "s6" = "Fazer arte é uma forma de desabafar.",
+  "s7" = "Consigo preservar um sentimento marcante por meio da arte que crio.",
+  "s9" = "Eu alcanço uma compreensão mais profunda da minha psique por meio da arteterapia."
+)
+
+# 2. Gerar Embeddings via Cohere (v3.0)
+emb_elite_pt <- er_embed(itens_elite_pt, api = "cohere", model = "embed-multilingual-v3.0")
+rownames(emb_elite_pt) <- names(itens_elite_pt)
+
+# 3. Gerar os pares para predição (10 combinações)
+df_pares_elite <- expand.grid(Var1 = names(itens_elite_pt), 
+                              Var2 = names(itens_elite_pt), 
+                              stringsAsFactors = FALSE) %>%
+  dplyr::filter(Var1 < Var2)
+
+# 4. Gerar as features semânticas (Hadamard/Diferença Absoluta)
+df_feat_elite <- gerar_features_pred(df_pares_elite, emb_elite_pt)
+
+# 5. O Robô Especialista Musical estima as correlações para a Versão Elite
+pred_elite <- predict(mod_especialista_musica, df_feat_elite)
+
+# 6. Montar a Matriz In Silico da Versão Elite
+mat_elite_sim <- montar_matriz_5x5(pred_elite, names(itens_elite_pt))
+
+# 1. Preparar distâncias para o Teste de Mantel
+dist_elite_ia <- as.dist(1 - abs(mat_elite_sim))
+dist_humano   <- as.dist(1 - abs(cor_humana_vips)) # Sua matriz humana 5x5
+
+# 2. Executar Teste de Mantel (Elite vs Humano)
+mantel_elite <- ade4::mantel.rtest(dist_elite_ia, dist_humano, nrepet = 9999)
+
+# 3. Comparação de Centralidade (Elite vs Humano)
+ega_elite <- EGAnet::EGA(mat_elite_sim, n = 1000, model = "glasso", plot = FALSE)
+ega_humano <- EGAnet::EGA(cor_humana_vips, n = 232, model = "glasso", plot = FALSE)
+
+cor_cent_elite <- cor(
+  EGAnet::net.loads(ega_elite)$std[,1], 
+  EGAnet::net.loads(ega_humano)$std[,1], 
+  method = "spearman"
+)
+
+# 4. Cálculo do Erro Absoluto (MAE) da Versão Elite
+tri_h_5 <- cor_humana_vips[lower.tri(cor_humana_vips)]
+tri_e_5 <- mat_elite_sim[lower.tri(mat_elite_sim)]
+mae_elite <- mean(abs(tri_h_5 - tri_e_5))
+
+# --- RELATÓRIO DE IMPACTO DO REFINAMENTO ---
+cat("\n================================================")
+cat("\n📊 RESULTADO DO TESTE DE IMPACTO (ELITE)")
+cat("\n================================================")
+cat("\nCorrelação de Mantel (r):", round(mantel_elite$obs, 3))
+cat("\nP-valor de Mantel:", mantel_elite$pvalue)
+cat("\nCorrelação de Centralidade (rho):", round(cor_cent_elite, 3))
+cat("\nErro Médio Absoluto (MAE):", round(mae_elite, 3))
+cat("\n================================================\n")
+
+
+```
+
+#### Quadro 3
+
+```{r}
+tabela_triangulacao <- data.frame(
+  Item = vips_reais,
+  IA_Portugues = round(pseudo_interceptos_pt, 3),
+  IA_Ingles = round(pseudo_interceptos, 3),
+  Rasch_PCM = round(thresholds_reais, 3),
+  GRM_Samejima = round(dificuldade_grm, 3),
+  CFA_Intercepto = round(meus_interceptos_humanos, 3)
+)
+knitr::kable(tabela_triangulacao, caption = "Quadro 3: Triangulação da Localização de Itens")
+```
+
+```{r}
+sessionInfo()
+
+```
